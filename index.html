@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能写作辅助平台</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/vue@3.5.13/dist/vue.global.js"></script>
+</head>
+<body>
+<div id="app" v-cloak>
+
+  <!-- ==================== 登录/注册 ==================== -->
+  <div v-if="!user" class="login-wrap">
+    <div class="login-box">
+      <h1>✍️ 智能写作辅助平台</h1>
+      <p class="sub">Spring Boot + 大模型驱动的多场景智能创作系统</p>
+      <div class="login-tabs">
+        <span :class="{on: loginTab==='login'}" @click="loginTab='login'">登 录</span>
+        <span :class="{on: loginTab==='reg'}" @click="loginTab='reg'">注 册</span>
+      </div>
+      <input v-model="loginForm.username" placeholder="用户名" @keyup.enter="doLogin">
+      <input v-model="loginForm.password" type="password" placeholder="密码（至少6位）">
+      <input v-if="loginTab==='reg'" v-model="loginForm.nickname" placeholder="昵称（可选）">
+      <button :disabled="loading" @click="doLogin">
+        <span v-if="loading" class="spin"></span>{{ loginTab==='login' ? '登 录' : '注册并登录' }}
+      </button>
+      <div class="hint" v-if="loginTab==='login'">
+        演示账号：管理员 admin / admin123　·　普通用户 writer / user123
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 主布局 ==================== -->
+  <div v-else class="layout">
+    <aside class="sidebar">
+      <div class="logo">✍️ 智能写作平台</div>
+      <nav class="nav">
+        <button class="nav-item" :class="{on:view==='wb'}" @click="go('wb')">📝 写作工作台</button>
+        <button class="nav-item" :class="{on:view==='works'}" @click="go('works')">📚 我的作品</button>
+        <button class="nav-item" :class="{on:view==='usage'}" @click="go('usage')">📊 用量与计费</button>
+        <template v-if="user.role==='ADMIN'">
+          <button class="nav-item" :class="{on:view==='admin'}" @click="go('admin')">⚙️ 系统管理</button>
+        </template>
+      </nav>
+      <div class="userbox">
+        <div class="name">{{ user.nickname }} <span class="tag" style="background:#1f2937;color:#a5b4fc">{{ user.role==='ADMIN'?'管理员':'作者' }}</span></div>
+        <div>已用 {{ fmtNum(user.tokensUsed) }} tokens</div>
+        <button class="ghost small" style="margin-top:10px;color:#cbd5e1;background:#1f2937;border:none" @click="doLogout">退出登录</button>
+      </div>
+    </aside>
+
+    <main class="main">
+
+      <!-- ==================== 写作工作台 ==================== -->
+      <div v-if="view==='wb'">
+        <div class="page-title">写作工作台</div>
+        <div class="wb">
+          <!-- 左：模板选择 + 变量填写 -->
+          <div>
+            <div class="card">
+              <div class="section-title">① 选择写作场景</div>
+              <div class="cat-chips">
+                <span class="chip" :class="{on:tplCat==='全部'}" @click="tplCat='全部'">全部</span>
+                <span class="chip" v-for="c in categories" :key="c" :class="{on:tplCat===c}" @click="tplCat=c">{{ c }}</span>
+              </div>
+              <div class="tpl-list">
+                <div class="tpl" v-for="t in filteredTemplates" :key="t.id"
+                     :class="{on: selectedTpl && selectedTpl.id===t.id}" @click="pickTemplate(t)">
+                  <div class="t"><span>{{ t.name }}</span><span class="tag gray">{{ t.category }}</span></div>
+                  <div class="d">{{ t.description }}</div>
+                </div>
+                <div class="empty" v-if="!filteredTemplates.length">暂无模板</div>
+              </div>
+            </div>
+            <div class="card" style="margin-top:14px" v-if="selectedTpl">
+              <div class="section-title">② 填写创作要素</div>
+              <div class="var-form">
+                <template v-for="v in tplVars" :key="v.key">
+                  <div>
+                    <label>{{ v.label }} <i v-if="v.required">*</i></label>
+                    <textarea v-if="v.label && v.label.length>12" v-model="tplVarValues[v.key]" rows="3" style="width:100%"></textarea>
+                    <input v-else v-model="tplVarValues[v.key]" style="width:100%" :placeholder="'请输入'+v.label">
+                  </div>
+                </template>
+                <div v-if="!tplVars.length" class="muted">该模板无必填要素，可直接生成。</div>
+                <button :disabled="loading" @click="doGenerate">
+                  <span v-if="loading" class="spin"></span>🤖 AI 生成内容
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 中：编辑器 -->
+          <div class="card">
+            <div class="section-title">③ 创作编辑区
+              <span class="muted" v-if="editor.workId">（作品 #{{ editor.status==='PUBLISHED' ? editor.workId : editor.workId}} · v{{ editor.version }} · {{ editor.status==='PUBLISHED'?'已发布':'草稿' }}）</span>
+            </div>
+            <input class="editor-title" v-model="editor.title" placeholder="作品标题">
+            <textarea class="editor-area" v-model="editor.content"
+                      placeholder="选择左侧模板点击「AI 生成内容」，或直接开始手工创作…"></textarea>
+            <div class="toolbar" style="margin-top:12px">
+              <button class="ghost" :disabled="loading" @click="doSave">💾 保存作品</button>
+              <button class="ghost" :disabled="loading || !editor.content" @click="openVersions">🕘 历史版本</button>
+              <button class="ghost" :disabled="!editor.workId" @click="doPublish" v-if="editor.workId">
+                {{ editor.status==='PUBLISHED' ? '撤回草稿' : '发布作品' }}
+              </button>
+              <span class="muted">{{ (editor.content||'').length }} 字</span>
+            </div>
+            <div class="gen-meta" v-if="lastGen">
+              最近一次AI生成：消耗 {{ lastGen.tokens }} tokens（提示 {{ lastGen.promptTokens }} / 补全 {{ lastGen.completionTokens }}）·
+              费用 ¥{{ lastGen.cost }} · {{ lastGen.realCall ? '真实大模型调用' : '本地模拟生成（未配置密钥）' }}
+            </div>
+          </div>
+
+          <!-- 右：AI助手 -->
+          <div>
+            <div class="card">
+              <div class="section-title">✨ 文本润色与优化</div>
+              <textarea v-model="polishReq" rows="2" style="width:100%;margin-bottom:8px" placeholder="个性化润色要求（可选），如：更正式一些"></textarea>
+              <button :disabled="loading || !editor.content" style="width:100%" @click="doPolish">
+                <span v-if="loading" class="spin"></span>🪄 一键润色当前内容
+              </button>
+            </div>
+            <div class="card" style="margin-top:14px">
+              <div class="section-title">💡 实时写作推荐</div>
+              <button class="ghost" :disabled="loading" style="width:100%" @click="doRecommend">
+                <span v-if="loading" class="spin"></span>获取下一步写作建议
+              </button>
+              <div style="margin-top:12px">
+                <div class="suggest-item" v-for="(s,i) in suggestions" :key="i">{{ s }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ==================== 我的作品 ==================== -->
+      <div v-if="view==='works'">
+        <div class="page-title">我的作品</div>
+        <div class="work-grid">
+          <div class="work-card" v-for="w in works" :key="w.id">
+            <h3>{{ w.title }}</h3>
+            <div class="p">{{ w.preview }}</div>
+            <div class="ops">
+              <span class="tag gray">{{ w.category || '未分类' }}</span>
+              <span class="tag" :class="w.status==='PUBLISHED'?'green':''">{{ w.status==='PUBLISHED'?'已发布':'草稿' }}</span>
+              <span class="muted">v{{ w.currentVersion }} · {{ fmtTime(w.updatedAt) }}</span>
+            </div>
+            <div class="ops">
+              <button class="small" @click="openWork(w.id)">继续创作</button>
+              <button class="ghost small" @click="previewWork(w.id)">预览</button>
+              <button class="ghost small" @click="doPublishById(w.id)">{{ w.status==='PUBLISHED'?'撤回':'发布' }}</button>
+              <button class="danger small" @click="doDeleteWork(w.id)">删除</button>
+            </div>
+          </div>
+          <div class="empty" v-if="!works.length" style="grid-column:1/-1">还没有作品，去工作台创作第一篇吧！</div>
+        </div>
+      </div>
+
+      <!-- ==================== 用量与计费 ==================== -->
+      <div v-if="view==='usage'">
+        <div class="page-title">我的用量与计费</div>
+        <div class="stat-cards">
+          <div class="stat"><div class="v">{{ usage.totalCalls || 0 }}</div><div class="k">AI调用次数</div></div>
+          <div class="stat"><div class="v">{{ fmtNum(usage.totalTokens) }}</div><div class="k">累计消耗 Tokens</div></div>
+          <div class="stat"><div class="v">¥{{ (usage.totalCost||0).toFixed(4) }}</div><div class="k">累计费用</div></div>
+          <div class="stat"><div class="v">{{ fmtNum(usage.freeQuota) }}</div><div class="k">免费额度 Tokens</div></div>
+          <div class="stat"><div class="v">¥{{ usage.pricePer1kTokens }}</div><div class="k">每1K tokens单价</div></div>
+        </div>
+        <div class="card">
+          <div class="section-title">调用明细（最近50条）</div>
+          <table>
+            <thead><tr><th>时间</th><th>操作</th><th>Tokens</th><th>费用</th><th>模式</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr v-for="r in usage.recent" :key="r.id">
+                <td>{{ fmtTime(r.createdAt) }}</td>
+                <td><span class="tag">{{ opName(r.operation) }}</span></td>
+                <td>{{ r.totalTokens }}</td>
+                <td>¥{{ r.cost }}</td>
+                <td>{{ r.realCall ? '大模型' : '模拟' }}</td>
+                <td><span class="tag" :class="r.success?'green':'red'">{{ r.success?'成功':'失败' }}</span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="empty" v-if="!usage.recent || !usage.recent.length">暂无调用记录</div>
+        </div>
+      </div>
+
+      <!-- ==================== 系统管理 ==================== -->
+      <div v-if="view==='admin' && user.role==='ADMIN'">
+        <div class="page-title">系统管理</div>
+        <div class="tabs">
+          <span :class="{on:adminTab==='tpl'}" @click="switchAdmin('tpl')">模板管理</span>
+          <span :class="{on:adminTab==='key'}" @click="switchAdmin('key')">API密钥管理</span>
+          <span :class="{on:adminTab==='stat'}" @click="switchAdmin('stat')">全局用量统计</span>
+          <span :class="{on:adminTab==='user'}" @click="switchAdmin('user')">用户管理</span>
+        </div>
+
+        <!-- 模板管理 -->
+        <div class="card" v-if="adminTab==='tpl'">
+          <div class="toolbar"><button @click="openTplForm(null)">＋ 新建模板</button></div>
+          <table>
+            <thead><tr><th>ID</th><th>名称</th><th>场景</th><th>内置</th><th>使用次数</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="t in admin.tpls" :key="t.id">
+                <td>{{ t.id }}</td><td>{{ t.name }}</td><td>{{ t.category }}</td>
+                <td>{{ t.builtin ? '是' : '否' }}</td><td>{{ t.usageCount }}</td>
+                <td><span class="tag" :class="t.enabled?'green':'red'">{{ t.enabled?'启用':'停用' }}</span></td>
+                <td>
+                  <button class="link" @click="openTplForm(t)">编辑</button>
+                  <button class="link" @click="apiCall(()=>API.toggleTemplate(t.id), loadAdminTpl, '已切换状态')">{{ t.enabled?'停用':'启用' }}</button>
+                  <button class="link" style="color:var(--danger)" v-if="!t.builtin" @click="apiCall(()=>API.deleteTemplate(t.id), loadAdminTpl, '已删除')">删除</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 密钥管理 -->
+        <div class="card" v-if="adminTab==='key'">
+          <div class="toolbar">
+            <button @click="openKeyForm()">＋ 添加密钥</button>
+            <span class="muted">未配置激活密钥时，平台自动使用本地模拟生成，可离线体验。</span>
+          </div>
+          <table>
+            <thead><tr><th>名称</th><th>提供商</th><th>模型</th><th>密钥</th><th>状态</th><th>激活</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="k in admin.keys" :key="k.id">
+                <td>{{ k.name }}</td><td>{{ k.provider }}</td><td>{{ k.model }}</td>
+                <td><code>{{ k.apiKeyMasked }}</code></td>
+                <td><span class="tag" :class="k.status==='OK'?'green':(k.status==='FAILED'?'red':'gray')">{{ k.status }}</span></td>
+                <td><span class="tag" :class="k.active?'green':'gray'">{{ k.active?'使用中':'未激活' }}</span></td>
+                <td>
+                  <button class="link" @click="apiCall(()=>API.activateKey(k.id), loadAdminKeys, k.active?'已停用':'已激活该密钥')">{{ k.active?'停用':'激活' }}</button>
+                  <button class="link" :disabled="loading" @click="doTestKey(k.id)">测试</button>
+                  <button class="link" @click="openKeyForm(k)">编辑</button>
+                  <button class="link" style="color:var(--danger)" v-if="!k.active" @click="apiCall(()=>API.deleteKey(k.id), loadAdminKeys, '已删除')">删除</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="empty" v-if="!admin.keys.length">暂无密钥配置</div>
+        </div>
+
+        <!-- 全局统计 -->
+        <div v-if="adminTab==='stat'">
+          <div class="stat-cards">
+            <div class="stat"><div class="v">{{ admin.stats.totalRecords || 0 }}</div><div class="k">总调用次数</div></div>
+            <div class="stat"><div class="v">{{ admin.stats.callsToday || 0 }}</div><div class="k">今日调用</div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+            <div class="card">
+              <div class="section-title">按操作类型统计</div>
+              <table>
+                <thead><tr><th>操作</th><th>次数</th><th>Tokens</th><th>费用</th></tr></thead>
+                <tbody>
+                  <tr v-for="r in admin.stats.byOperation" :key="r.operation">
+                    <td>{{ opName(r.operation) }}</td><td>{{ r.calls }}</td><td>{{ fmtNum(r.tokens) }}</td><td>¥{{ Number(r.cost).toFixed(4) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="card">
+              <div class="section-title">按用户统计（计费）</div>
+              <table>
+                <thead><tr><th>用户</th><th>次数</th><th>Tokens</th><th>费用</th></tr></thead>
+                <tbody>
+                  <tr v-for="r in admin.stats.byUser" :key="r.userId">
+                    <td>{{ r.username }}</td><td>{{ r.calls }}</td><td>{{ fmtNum(r.tokens) }}</td><td>¥{{ Number(r.cost).toFixed(4) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- 用户管理 -->
+        <div class="card" v-if="adminTab==='user'">
+          <table>
+            <thead><tr><th>ID</th><th>用户名</th><th>昵称</th><th>角色</th><th>作品数</th><th>已用Tokens</th><th>费用</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr v-for="u in admin.users" :key="u.id">
+                <td>{{ u.id }}</td><td>{{ u.username }}</td><td>{{ u.nickname }}</td>
+                <td><span class="tag" :class="u.role==='ADMIN'?'':'gray'">{{ u.role }}</span></td>
+                <td>{{ u.workCount }}</td><td>{{ fmtNum(u.tokensUsed) }}</td>
+                <td>¥{{ Number(u.costIncurred).toFixed(4) }}</td>
+                <td><span class="tag" :class="u.status==='NORMAL'?'green':'red'">{{ u.status==='NORMAL'?'正常':'已封禁' }}</span></td>
+                <td>
+                  <button class="link" v-if="u.role!=='ADMIN'" @click="apiCall(()=>API.banUser(u.id), loadAdminUsers, '已切换封禁状态')">{{ u.status==='NORMAL'?'封禁':'解封' }}</button>
+                  <button class="link" @click="doResetPwd(u)">重置密码</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ==================== 历史版本弹窗 ==================== -->
+  <div class="modal-mask" v-if="verModal" @click.self="verModal=false">
+    <div class="modal">
+      <h3>创作历史版本 <span class="muted">（作品 #{{ editor.workId }}）</span></h3>
+      <table>
+        <thead><tr><th>版本</th><th>类型</th><th>说明</th><th>字数</th><th>时间</th><th>操作</th></tr></thead>
+        <tbody>
+          <tr v-for="v in versions" :key="v.id">
+            <td>v{{ v.versionNo }}</td>
+            <td><span class="tag" :class="v.changeType==='GENERATE'?'':'gray'">{{ verTypeName(v.changeType) }}</span></td>
+            <td>{{ v.changeNote }}</td><td>{{ v.length }}</td><td>{{ fmtTime(v.createdAt) }}</td>
+            <td>
+              <button class="link" @click="doPreviewVersion(v.versionNo)">查看</button>
+              <button class="link" @click="apiCall(()=>API.restore(editor.workId, v.versionNo), afterRestore, '已回滚到 v'+v.versionNo)">回滚</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="empty" v-if="!versions.length">暂无历史版本</div>
+      <div class="foot"><button class="ghost" @click="verModal=false">关闭</button></div>
+    </div>
+  </div>
+
+  <!-- ==================== 内容预览弹窗 ==================== -->
+  <div class="modal-mask" v-if="previewModal" @click.self="previewModal=false">
+    <div class="modal">
+      <h3>{{ previewTitle }}</h3>
+      <div style="white-space:pre-wrap;line-height:1.9;font-size:14px;max-height:60vh;overflow-y:auto">{{ previewContent }}</div>
+      <div class="foot"><button class="ghost" @click="previewModal=false">关闭</button></div>
+    </div>
+  </div>
+
+  <!-- ==================== 模板编辑弹窗 ==================== -->
+  <div class="modal-mask" v-if="tplFormModal" @click.self="tplFormModal=false">
+    <div class="modal">
+      <h3>{{ tplForm.id ? '编辑模板' : '新建模板' }}</h3>
+      <div class="form-grid">
+        <label>模板名称 *</label><input v-model="tplForm.name">
+        <label>场景分类 *</label><input v-model="tplForm.category" placeholder="如：公文/营销/学术">
+        <label>描述</label><input v-model="tplForm.description">
+        <label>系统提示词</label><textarea v-model="tplForm.systemPrompt" rows="3" placeholder="设定模型角色，如：你是一位资深公文秘书"></textarea>
+        <label>提示词模板</label><textarea v-model="tplForm.promptTemplate" rows="4" placeholder="支持 {{变量}} 占位符，如：请围绕{{topic}}写一篇…"></textarea>
+        <label>变量定义(JSON)</label><textarea v-model="tplForm.variables" rows="4" placeholder='[{"key":"topic","label":"主题","required":true}]'></textarea>
+      </div>
+      <div class="foot">
+        <button class="ghost" @click="tplFormModal=false">取消</button>
+        <button :disabled="loading" @click="doSaveTpl">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 密钥编辑弹窗 ==================== -->
+  <div class="modal-mask" v-if="keyFormModal" @click.self="keyFormModal=false">
+    <div class="modal">
+      <h3>{{ keyForm.id ? '编辑密钥' : '添加密钥' }}</h3>
+      <div class="form-grid">
+        <label>名称 *</label><input v-model="keyForm.name" placeholder="如：阿里云百炼">
+        <label>提供商 *</label>
+        <select v-model="keyForm.provider">
+          <option value="dashscope">阿里云 DashScope (通义千问)</option>
+          <option value="openai">OpenAI 兼容接口</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="moonshot">Moonshot (Kimi)</option>
+          <option value="other">其他</option>
+        </select>
+        <label>Base URL *</label><input v-model="keyForm.baseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+        <label>模型 *</label><input v-model="keyForm.model" placeholder="qwen-plus / gpt-4o-mini / deepseek-chat">
+        <label>API Key *</label><input v-model="keyForm.apiKey" :placeholder="keyForm.id ? '留空则保持原密钥不变' : 'sk-...'">
+        <label>备注</label><input v-model="keyForm.remark">
+      </div>
+      <div class="hint" style="margin-top:14px">支持所有 OpenAI Chat Completions 兼容协议。保存后可点击「激活」使其生效、「测试」验证连通性。</div>
+      <div class="foot">
+        <button class="ghost" @click="keyFormModal=false">取消</button>
+        <button :disabled="loading" @click="doSaveKey">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div v-if="toast" class="toast" :class="toastType">{{ toast }}</div>
+</div>
+
+<script src="js/api.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
